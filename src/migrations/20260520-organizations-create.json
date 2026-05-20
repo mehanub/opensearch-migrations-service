@@ -1,0 +1,27 @@
+{
+  "type": "create",
+  "index": "organizations",
+  "alias": "organizations",
+  "description": "Initial organizations index schema",
+  "values": {
+    "mappings": {
+      "properties": {
+        "uuid": { "type": "keyword" },
+        "name": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword"
+            }
+          }
+        },
+        "inn": { "type": "keyword" },
+        "kpp": { "type": "keyword" },
+        "is_key_client": { "type": "boolean" },
+        "date_begin": { "type": "date", "format": "strict_date_time" },
+        "created_at": { "type": "date" },
+        "updated_at": { "type": "date" }
+      }
+    }
+  }
+}

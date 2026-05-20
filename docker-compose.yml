@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # PostgreSQL для хранения метаинформации о миграциях
+  postgres:
+    image: postgres:15-alpine
+    container_name: opensearch-migration-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_DB: ${DB_DATABASE:-migration_db}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - migration-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-postgres} -d ${DB_DATABASE:-migration_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OpenSearch для хранения данных
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: opensearch-migration-opensearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      cluster.name: opensearch-cluster
+      node.name: opensearch-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      compatibility.override_main_response_version: "true"
+      bootstrap.memory_lock: true
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      indices.query.bool.max_clause_count: 1024
+      action.auto_create_index: true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "${OPENSEARCH_PORT:-9200}:9200"
+      - "${OPENSEARCH_TRANSPORT_PORT:-9600}:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    networks:
+      - migration-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # OpenSearch Dashboards
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: opensearch-migration-dashboards
+    restart: unless-stopped
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      - "${DASHBOARDS_PORT:-5601}:5601"
+    networks:
+      - migration-network
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+networks:
+  migration-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  opensearch_data:
+    driver: local
