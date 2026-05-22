@@ -2,7 +2,7 @@
   "type": "migrate",
   "index": "organizations",
   "alias": "organizations",
-  "description": "Organization migrate schema",
+  "description": "Initial organizations index schema",
   "values": {
     "mappings": {
       "properties": {
@@ -21,8 +21,12 @@
         "date_begin": { "type": "date", "format": "strict_date_time" },
         "created_at": { "type": "date" },
         "updated_at": { "type": "date" },
-        "updated_by": { "type": "text" }
+        "inn_kpp": { "type": "text" },
+        "updated_by": {"type": "text"}
       }
     }
+  },
+  "transform":{
+    "script":"ctx._source.inn_kpp = ctx._source.inn + ' / ' + ctx._source.kpp; ctx._source.updated_by = 'undefined'"
   }
 }

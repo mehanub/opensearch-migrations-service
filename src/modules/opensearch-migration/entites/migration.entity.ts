@@ -17,7 +17,7 @@ export class MigrationEntity {
   version: string;
 
   @Column({ type: 'varchar', length: 50, default: 'pending' })
-  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'rolled_back';
+  status: 'pending' | 'in_progress' | 'completed' | 'failed' ;
 
   @Column({ type: 'bigint', nullable: true })
   totalDocs: number;
