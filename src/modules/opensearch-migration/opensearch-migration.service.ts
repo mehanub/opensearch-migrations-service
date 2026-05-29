@@ -1,10 +1,9 @@
 import { Injectable, Logger, OnModuleInit, Inject, Optional } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { Client } from '@opensearch-project/opensearch';
-import { MigrationEntity } from './entites/migration.entity';
 import { MigrationConfig } from './interfaces/migration.interface';
+import { IMigrationRepository, MigrationRecord } from './interfaces/migration-repository.interface';
+import { OpenSearchService, DualWriteTarget } from './opensearch.service';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -17,50 +16,39 @@ export class OpenSearchMigrationService implements OnModuleInit {
   private isProcessing = false;
 
   constructor(
-    @InjectRepository(MigrationEntity)
-    private readonly migrationRepo: Repository<MigrationEntity>,
+    @Inject('MIGRATION_REPOSITORY')
+    private readonly migrationRepository: IMigrationRepository,
     @Inject('OPENSEARCH_CLIENT')
     private readonly opensearchClient?: Client,
     @Optional() @Inject('MIGRATIONS_PATH') customPath?: string,
+    @Optional() private readonly dualWriteService?: OpenSearchService,
   ) {
     this.migrationsPath = customPath || process.env.MIGRATIONS_PATH || './src/migrations/opensearch';
   }
 
   async onModuleInit() {
-    await this.ensureMigrationTableExists();
+    await this.migrationRepository.ensureSchema();
     await this.loadMigrationsFromDirectory();
     await this.resumePendingMigrations();
     await this.runPendingMigrations();
+    await this.syncDualWriteTargets();
 
     this.logger.log(`OpenSearch Migration Service initialized. Loaded ${this.migrations.size} migrations`);
   }
 
-  private async ensureMigrationTableExists() {
-    try {
-      await this.migrationRepo.query(`
-        CREATE TABLE IF NOT EXISTS opensearch_migrations (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          migration_name VARCHAR(255) NOT NULL,
-          type VARCHAR(50) NOT NULL,
-          version VARCHAR(50),
-          index VARCHAR(255) NOT NULL,
-          alias VARCHAR(255) NOT NULL,
-          status VARCHAR(50) DEFAULT 'pending',
-          task_id VARCHAR(255),
-          error_message TEXT,
-          metadata JSONB,
-          started_by VARCHAR(255),
-          created_at TIMESTAMP DEFAULT NOW(),
-          updated_at TIMESTAMP DEFAULT NOW(),
-          started_at TIMESTAMP,
-          completed_at TIMESTAMP
-        );
-      `);
+  private async syncDualWriteTargets(): Promise<void> {
+    if (!this.dualWriteService) return;
 
-      this.logger.log('Migration table ensured');
-    } catch (error) {
-      this.logger.warn(`Migration table creation: ${error}`);
+    const active = await this.migrationRepository.findInProgressMigrate();
+
+    const targets = new Map<string, DualWriteTarget>();
+    for (const m of active) {
+      if (m.sourceIndex) {
+        targets.set(m.alias, { sourceIndex: m.sourceIndex, destIndex: m.index });
+      }
     }
+
+    this.dualWriteService.setTargets(targets);
   }
 
   private async loadMigrationsFromDirectory() {
@@ -85,17 +73,15 @@ export class OpenSearchMigrationService implements OnModuleInit {
         this.migrations.set(migrationName, migration);
         this.logger.log(`Loaded migration: ${migrationName} -> ${migration.index} ${migration.version || 'v1'}`);
 
-      } catch (error ) {
+      } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         this.logger.error(`Failed: ${errorMessage}`);
       }
     }
-  }W
+  }
 
   private async resumePendingMigrations() {
-    const pending = await this.migrationRepo.find({
-      where: [{ status: 'in_progress' }, { status: 'pending' }],
-    });
+    const pending = await this.migrationRepository.findActive();
 
     for (const migration of pending) {
       if (migration.taskId) {
@@ -110,9 +96,7 @@ export class OpenSearchMigrationService implements OnModuleInit {
     this.isProcessing = true;
 
     try {
-      const completedMigrations = await this.migrationRepo.find({
-        where: { status: 'completed' },
-      });
+      const completedMigrations = await this.migrationRepository.findCompleted();
 
       const completedNames = new Set(completedMigrations.map(m => m.migrationName));
       const newMigrations = Array.from(this.migrations.keys())
@@ -130,9 +114,10 @@ export class OpenSearchMigrationService implements OnModuleInit {
         const config = this.migrations.get(migrationName);
         if (!config) continue;
 
-        const alreadyStarted = await this.migrationRepo.findOne({
-          where: { migrationName, status: In(['pending', 'in_progress']) },
-        });
+        const alreadyStarted = await this.migrationRepository.findOneByNameAndStatuses(
+          migrationName,
+          ['pending', 'in_progress'],
+        );
 
         if (alreadyStarted) {
           this.logger.log(`Migration ${migrationName} already in progress, skipping`);
@@ -142,8 +127,8 @@ export class OpenSearchMigrationService implements OnModuleInit {
         await this.startMigration(migrationName, config, 'auto-start');
       }
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        this.logger.error(`Failed: ${errorMessage}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Failed: ${errorMessage}`);
     } finally {
       this.isProcessing = false;
     }
@@ -152,44 +137,49 @@ export class OpenSearchMigrationService implements OnModuleInit {
   private async startMigration(migrationName: string, config: MigrationConfig, startedBy: string = 'auto-start') {
     const nextIndexName = await this.getNextIndexName(config);
 
-    const migration = this.migrationRepo.create({
+    const migration = await this.migrationRepository.insert({
       migrationName,
       type: config.type,
-      version: config.version,
+      version: config.version ?? null,
       index: nextIndexName,
       alias: config.alias,
       status: 'pending',
       startedBy,
-      metadata: config
+      metadata: config,
+      totalDocs: null,
+      createdDocs: null,
+      errorMessage: null,
+      taskId: null,
+      sourceIndex: null,
+      startedAt: null,
+      completedAt: null,
     });
 
-    await this.migrationRepo.save(migration);
     this.logger.log(`Created migration record: ${migrationName} (${migration.id})`);
 
-    const migrationRecord = await this.migrationRepo.findOne({ where: { id: migration.id } });
+    const migrationRecord = await this.migrationRepository.findOneById(migration.id);
     if (!migrationRecord) return;
 
     switch (config.type) {
-			case 'create':
-				await this.executeCreateScheme(migration, config);
-				break;
-			case 'migrate':
-				await this.executeMigrateScheme(migration, config);
-				break;
-			default:
-				this.logger.error(`Definition type ${config.type} not supported`);
-				process.exit(1);
-		}
+      case 'create':
+        await this.executeCreateScheme(migration, config);
+        break;
+      case 'migrate':
+        await this.executeMigrateScheme(migration, config);
+        break;
+      default:
+        this.logger.error(`Definition type ${config.type} not supported`);
+        process.exit(1);
+    }
   }
 
-
-  async executeMigrateScheme(migration: MigrationEntity, config: MigrationConfig){
+  async executeMigrateScheme(migration: MigrationRecord, config: MigrationConfig) {
     try {
-      await this.migrationRepo.update(migration.id, {
+      await this.migrationRepository.update(migration.id, {
         status: 'in_progress',
         startedAt: new Date(),
       });
-      
+
       const sourceIndex = await this.getCurrentIndexName(config.alias);
 
       const lastIndexVersionString = sourceIndex.split('-').pop();
@@ -221,7 +211,7 @@ export class OpenSearchMigrationService implements OnModuleInit {
           source: config.transform.script,
           lang: 'painless',
         };
-      } 
+      }
 
       const reindexResponse = await this.opensearchClient.reindex({
         wait_for_completion: false,
@@ -230,45 +220,45 @@ export class OpenSearchMigrationService implements OnModuleInit {
 
       const taskId = reindexResponse.body.task;
 
-      await this.migrationRepo.update(migration.id, {
-        taskId
+      await this.migrationRepository.update(migration.id, {
+        taskId,
+        sourceIndex,
       });
 
       this.activeTaskIds.add(taskId);
       this.logger.log(`Reindex started: ${taskId}`);
+      await this.syncDualWriteTargets();
     } catch (error) {
-      
-      await this.migrationRepo.update(migration.id, {
+      await this.migrationRepository.update(migration.id, {
         status: 'failed',
         errorMessage: 'error',
-        completedAt: new Date()
+        completedAt: new Date(),
       });
       process.exit(1);
     }
   }
 
-  async executeCreateScheme(migration: MigrationEntity, config: MigrationConfig){
-
+  async executeCreateScheme(migration: MigrationRecord, config: MigrationConfig) {
     if (!this.opensearchClient) {
       throw new Error('OpenSearch client not available');
     }
 
     try {
-      await this.migrationRepo.update(migration.id, {
+      await this.migrationRepository.update(migration.id, {
         status: 'in_progress',
         startedAt: new Date(),
       });
+
       const response = await this.opensearchClient.indices.get({ index: `${migration.index}` }, { ignore: [404] });
       if (response.statusCode === 200) {
         this.logger.log(`Index ${migration.index} already exists, skipping...`);
-         throw (`Index ${migration.index} already exists, skipping...`)
+        throw (`Index ${migration.index} already exists, skipping...`);
       }
 
-		// Check if alias already exists
-		const aliasResponse = await this.opensearchClient.indices.getAlias({ name: config.alias }, { ignore: [404] });
-		if (aliasResponse.statusCode === 200) {
-			  throw (`Index ${migration.index} already exists, skipping...`)
-		}
+      const aliasResponse = await this.opensearchClient.indices.getAlias({ name: config.alias }, { ignore: [404] });
+      if (aliasResponse.statusCode === 200) {
+        throw (`Index ${migration.index} already exists, skipping...`);
+      }
 
       this.logger.log(`Creating index: ${migration.index}`);
       await this.opensearchClient.indices.create({
@@ -278,31 +268,27 @@ export class OpenSearchMigrationService implements OnModuleInit {
         },
       });
 
-		// Create alias pointing to the versioned index
-		await this.opensearchClient.indices.putAlias({ index: `${migration.index}`, name: `${config.alias}` });
+      await this.opensearchClient.indices.putAlias({ index: `${migration.index}`, name: `${config.alias}` });
 
-    await this.migrationRepo.update(migration.id, {
-          status: 'completed', 
-          completedAt: new Date() 
-    }); 
+      await this.migrationRepository.update(migration.id, {
+        status: 'completed',
+        completedAt: new Date(),
+      });
     } catch (error) {
-      await this.migrationRepo.update(migration.id, {
+      await this.migrationRepository.update(migration.id, {
         status: 'failed',
         errorMessage: 'error',
-        completedAt: new Date()
+        completedAt: new Date(),
       });
       process.exit(1);
     }
   }
 
-
   @Cron(CronExpression.EVERY_MINUTE)
   async checkActiveMigrations() {
     if (this.activeTaskIds.size === 0) return;
 
-    const activeMigrations = await this.migrationRepo.find({
-      where: { status: 'in_progress', type: 'migrate'},
-    });
+    const activeMigrations = await this.migrationRepository.findInProgressMigrate();
 
     for (const migration of activeMigrations) {
       if (!migration.taskId || !this.opensearchClient) continue;
@@ -312,47 +298,55 @@ export class OpenSearchMigrationService implements OnModuleInit {
 
         if (status.body.completed) {
           const response = status.body.response;
-
           const config = this.migrations.get(migration.migrationName);
-         // validationError = await this.validateMigration(migration.index, config);
+
+          const validationError = await this.validateMigration(migration, config);
+          if (validationError) {
+            this.logger.error(`❌ Migration ${migration.migrationName} validation failed: ${validationError}`);
+            await this.failMigration(migration, `Validation failed: ${validationError}`);
+            continue;
+          }
 
           await this.switchAliasToNewIndex(migration.index, migration.alias);
-          this.logger.log(`✅ Migration ${migration.migrationName} completed! (${response.created} docs created)`);
-
-          this.activeTaskIds.delete(migration.taskId);
-
-           await this.migrationRepo.update(migration.id, {
-            status:  'completed',
-            totalDocs: response.total,
-            createdDocs: response.created,
-            completedAt: new Date()
-          });
+          await this.completeMigration(migration, response.total, response.created);
         } else if (status.body.error) {
-          await this.migrationRepo.update(migration.id, {
-            status: 'failed',
-            errorMessage: status.body.error.reason,
-            completedAt: new Date(),
-          });
-          this.activeTaskIds.delete(migration.taskId);
           this.logger.error(`❌ Migration ${migration.migrationName} failed: ${status.body.error.reason}`);
+          await this.failMigration(migration, status.body.error.reason);
         }
       } catch (error: any) {
         if (error.statusCode === 404) {
           this.logger.warn(`Task ${migration.taskId} not found`);
-          await this.migrationRepo.update(migration.id, {
-            status: 'failed',
-            errorMessage: `Task not found: ${error.message}`,
-            completedAt: new Date(),
-          });
-          this.activeTaskIds.delete(migration.taskId);
+          await this.failMigration(migration, `Task not found: ${error.message}`);
         }
       }
     }
   }
 
+  private async failMigration(migration: MigrationRecord, errorMessage: string): Promise<void> {
+    await this.migrationRepository.update(migration.id, {
+      status: 'failed',
+      errorMessage,
+      completedAt: new Date(),
+    });
+    if (migration.taskId) this.activeTaskIds.delete(migration.taskId);
+    await this.syncDualWriteTargets();
+  }
+
+  private async completeMigration(migration: MigrationRecord, totalDocs: number, createdDocs: number): Promise<void> {
+    this.activeTaskIds.delete(migration.taskId);
+    await this.migrationRepository.update(migration.id, {
+      status: 'completed',
+      totalDocs,
+      createdDocs,
+      completedAt: new Date(),
+    });
+    await this.syncDualWriteTargets();
+    this.logger.log(`✅ Migration ${migration.migrationName} completed! (${createdDocs} docs created)`);
+  }
+
   private async switchAliasToNewIndex(newIndex: string, allias: string) {
     if (!this.opensearchClient) return;
-    
+
     try {
       const current = await this.opensearchClient.cat.aliases({ name: allias, format: 'json' });
       const currentIndices = current.body.map((item: any) => item.index);
@@ -372,19 +366,16 @@ export class OpenSearchMigrationService implements OnModuleInit {
     }
   }
 
-
   private async getCurrentIndexName(pAlias: string): Promise<string> {
     if (!this.opensearchClient) {
       return null;
     }
     try {
       const response = await this.opensearchClient.indices.get({ index: `${pAlias}-*` }, { ignore: [404] });
-       if (response && response.body && Object.keys(response.body).length > 0) {
-        // Get last index version
+      if (response && response.body && Object.keys(response.body).length > 0) {
         const indices = Object.entries(response.body)
           .map(([key]) => key)
           .sort((a, b) => {
-            // Extract version numbers for proper numeric sorting
             const versionA = parseInt(a.split('-').pop()?.slice(1) ?? '0');
             const versionB = parseInt(b.split('-').pop()?.slice(1) ?? '0');
             return versionA - versionB;
@@ -396,17 +387,58 @@ export class OpenSearchMigrationService implements OnModuleInit {
       this.logger.warn(`Alias ${pAlias} not found`);
     }
 
-    return  null;
+    return null;
   }
 
-  private async getNextIndexName(pConfig: MigrationConfig): Promise<string>{
-     const sourceIndex = await this.getCurrentIndexName(pConfig.alias);
-     if (!sourceIndex) return  pConfig.alias + '-v1';
+  private async getNextIndexName(pConfig: MigrationConfig): Promise<string> {
+    const sourceIndex = await this.getCurrentIndexName(pConfig.alias);
+    if (!sourceIndex) return pConfig.alias + '-v1';
     const lastIndexVersionString = sourceIndex.split('-').pop();
     const lastIndexVersion = parseInt(lastIndexVersionString?.slice(1) ?? '0');
-    
-    return  `${pConfig.alias}-v${lastIndexVersion + 1}`;
 
+    return `${pConfig.alias}-v${lastIndexVersion + 1}`;
   }
 
+  private async validateMigration(migration: MigrationRecord, config: MigrationConfig): Promise<string | null> {
+    const errors: string[] = [];
+
+    if (migration.sourceIndex) {
+      try {
+        const [sourceRes, destRes] = await Promise.all([
+          this.opensearchClient.count({ index: migration.sourceIndex }),
+          this.opensearchClient.count({ index: migration.index }),
+        ]);
+        const sourceDocs = sourceRes.body.count as number;
+        const destDocs = destRes.body.count as number;
+        this.logger.log(`Doc count: ${migration.sourceIndex}=${sourceDocs}, ${migration.index}=${destDocs}`);
+        if (destDocs < sourceDocs) {
+          errors.push(`Doc count mismatch: source=${sourceDocs}, dest=${destDocs} (${sourceDocs - destDocs} missing)`);
+        }
+      } catch (error: any) {
+        errors.push(`Count check failed: ${error.message}`);
+      }
+    }
+
+    try {
+      const mappingRes = await this.opensearchClient.indices.getMapping({ index: migration.index });
+      const actualProps: Record<string, any> = mappingRes.body[migration.index]?.mappings?.properties ?? {};
+      const expectedProps: Record<string, any> = config.values.mappings?.properties ?? {};
+      const missingFields: string[] = [];
+      const typeMismatches: string[] = [];
+      for (const [field, def] of Object.entries(expectedProps)) {
+        if (!actualProps[field]) {
+          missingFields.push(field);
+        } else if ((def as any).type && actualProps[field].type !== (def as any).type) {
+          typeMismatches.push(`${field}: expected=${(def as any).type}, actual=${actualProps[field].type}`);
+        }
+      }
+      this.logger.log(`Schema: ${Object.keys(actualProps).length} fields in index, ${Object.keys(expectedProps).length} expected`);
+      if (missingFields.length > 0) errors.push(`Missing fields: ${missingFields.join(', ')}`);
+      if (typeMismatches.length > 0) errors.push(`Type mismatch: ${typeMismatches.join('; ')}`);
+    } catch (error: any) {
+      errors.push(`Schema check failed: ${error.message}`);
+    }
+
+    return errors.length > 0 ? errors.join(' | ') : null;
+  }
 }

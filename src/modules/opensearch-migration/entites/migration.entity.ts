@@ -34,6 +34,9 @@ export class MigrationEntity {
   @Column({type: 'varchar'})
   index: string;
 
+  @Column({ name: 'source_index', type: 'varchar', nullable: true })
+  sourceIndex: string;
+
   @Column({type: 'varchar'})
   alias: string
 

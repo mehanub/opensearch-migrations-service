@@ -1,7 +1,12 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { Repository, DataSource } from 'typeorm';
+import { getRepositoryToken } from '@nestjs/typeorm';
 import { AppService } from './app.service';
 import { OpenSearchMigrationModule } from './opensearch-migration/opensearch-migration.module';
+import { OrganizationModule } from './organization/organization.module';
+import { MigrationEntity } from './opensearch-migration/entites/migration.entity';
+import { TypeOrmMigrationRepository } from './opensearch-migration/adapters/typeorm/typeorm-migration.repository';
 
 @Module({
   imports: [
@@ -15,12 +20,18 @@ import { OpenSearchMigrationModule } from './opensearch-migration/opensearch-mig
       synchronize: true,
       autoLoadEntities: true,
     }),
-    OpenSearchMigrationModule.forRoot({
-      migrationsPath: './src/migrations/',
-      opensearchNode: process.env.OPENSEARCH_URL,
-      opensearchUsername: process.env.OPENSEARCH_USERNAME,
-      opensearchPassword: process.env.OPENSEARCH_PASSWORD
+    OpenSearchMigrationModule.forRootAsync({
+      imports: [TypeOrmModule.forFeature([MigrationEntity])],
+      useFactory: (repo: Repository<MigrationEntity>, dataSource: DataSource) => ({
+        repository: new TypeOrmMigrationRepository(repo, dataSource),
+        opensearchNode: process.env.OPENSEARCH_URL,
+        opensearchUsername: process.env.OPENSEARCH_USERNAME,
+        opensearchPassword: process.env.OPENSEARCH_PASSWORD,
+        migrationsPath: './src/migrations/',
+      }),
+      inject: [getRepositoryToken(MigrationEntity), DataSource],
     }),
+    OrganizationModule,
   ],
   providers: [AppService],
 })

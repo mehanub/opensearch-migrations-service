@@ -1,5 +1,9 @@
-// index.ts
 export * from './opensearch-migration.module';
 export * from './opensearch-migration.service';
+export * from './opensearch.service';
 export * from './interfaces/migration.interface';
+export * from './interfaces/migration-repository.interface';
 export * from './entites/migration.entity';
+export * from './adapters/typeorm/typeorm-migration.repository';
+export * from './adapters/kysely/kysely-migration.repository';
+export * from './adapters/kysely/kysely.types';
